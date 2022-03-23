@@ -1,0 +1,688 @@
+---
+title: "Using Monte Carlo simulation to estimate required sample size in R"
+author: "Tamas Nagy"
+date: "6/9/2021"
+output: 
+  html_document:
+   theme: spacelab
+   code_download: true
+   toc: true
+   toc_float: true
+editor_options: 
+  chunk_output_type: console
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE, message = FALSE, warning = FALSE}
+# Install uninstalled packages
+if(!require(tidyverse)) install.packages("tidyverse")
+if(!require(lmerTest)) install.packages("lmerTest")
+if(!require(broom)) install.packages("broom")
+if(!require(broom.mixed)) install.packages("broom.mixed")
+if(!require(faux)) install.packages("faux")
+if(!require(furrr)) install.packages("furrr")
+
+# Load packages
+library(tidyverse) # data transformation + viz
+library(lmerTest) # mixed-effect models
+library(broom) # standardized statistics output
+library(broom.mixed) # standardized statistics output
+library(faux) # transforming distributions
+library(furrr) # parallel processing
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+theme_set(theme_light()) # Set plot theme
+```
+
+# What is this?
+
+This is a step-by-step tutorial to use Monte Carlo simulation for estimating the required sample size for a hypothesis test. Accompanying slides: https://docs.google.com/presentation/d/1wQGDNUw7c2zxIZOnrCpifQcsjeKOdqnVQkeankOBbhA
+
+# 1. Create a prototype
+
+## Define the hypothesis and make a prediction!
+
+We hypothesize that a drinking alcohol will increase response time during driving.
+In *Study 1*, we give alcohol (or placebo) to participants, and in a parallel groups study, investigate if the response time is longer in the alcohol group.
+We start with this simple example, and develop it into a more elaborate design.
+
+## The formula that will evaluate our hypothesis in Study 1
+
+`rt ~ group`
+
+So now we know that we need:
+
+-   rt: reaction time.
+-   group: variable with 2 levels: alcohol and placebo.
+
+## Estimate the effect size
+
+We need to come up with an effect size, i.e. the average difference that we expect between the group means.
+
+For that, we use the Smallest Effect Size of Interest (SESOI).
+It is very easy, because we can define it on the original original scale in miliseconds, so we don't have to deal with standardized effect sizes, etc.
+Let's say, that we assume that the SESOI is 25 ms.
+
+Let's generate the distribution for this variable!
+
+## Generate the outcome variable
+
+We need to decide the mean and standard deviation of this variable.
+Usually, we can find these values in journal articles, or make an educated guess.
+Let's set the mean rt to 400ms, with a standard deviation of 100.
+A great thing about this approach is that we can define any distribution, not just normal.
+
+Let's generate 1000 random data points!
+
+```{r proto random variable}
+set.seed(123)
+
+rt_random <-
+  rnorm(n = 1000, # How many values we want? 
+        mean = 400,
+        sd = 100) 
+
+ggplot() +
+  aes(x = rt_random) +
+  geom_histogram(bins = 30) +
+  labs(title = "1000 generated random RT measurements")
+```
+
+According to the hypothesis, we should break down this 1000 values into 2 cells: alcohol and placebo.
+The post treatment needs to have a lower value by 5 units.
+To do this, we will create a data frame:
+
+-   we use the rt_random variable
+-   we create the groupings
+-   we subtract the SESOI (that we defined as 25 units) from the post-treatment condition.
+
+```{r proto dataset}
+# Define the groups
+groups <- c("Alcohol", "Placebo")
+
+# Create a dataframe 
+rt_df <-  
+  tibble(id = gl(n = 1000, k = 1), # Generate the id (everyone has 1 measurement)
+         rt = rt_random, # Use the random rt variable that we generated
+         group = gl(n = 2, k = 1, length = 1000, labels = groups) # Assign each case to one of the four groups
+         ) %>% 
+    # Add the effect size(25) from the rt values to the alcohol group
+    mutate(rt = if_else(condition = group == "Alcohol", 
+                        true = rt + 25, 
+                        false = rt)) %>%
+    # Let's set the placebo group the reference group
+    mutate(group = fct_relevel(group, "Placebo")) 
+
+# This is how our dataframe will look like
+rt_df
+```
+
+```{r proto dataviz}
+
+# We can also visualize the difference between the groups
+rt_df %>% 
+  group_by(group) %>% 
+  mutate(avg_rt = mean(rt)) %>% 
+  ggplot() +
+  aes(x = group, y = rt) +
+  geom_violin(aes(fill = group), alpha = .5) +
+  geom_boxplot(alpha = .5, width = .5) +
+  geom_hline(aes(yintercept = avg_rt))
+
+```
+
+## See if there is a significant difference
+
+We will use a linear regression (in this case, equivalent to a t-test).
+
+```{r proto stats}
+lm(rt ~ group, data = rt_df) %>% 
+  summary()
+```
+
+As we can see, there is a significant difference, and the difference is somewhat different to the 25 units that we wanted (due to the randomness of the data).
+However, we had 1000 participants, and we need to figure out if this effect is detectable with smaller sample size.
+To do that, we need to break down this previous prototype into substitutible elements.
+
+------------------------------------------------------------------------
+
+It would be possible to run the previous the previous script several times, and see how the significance changes if we change the sample size or the standard deviation of the outcome measure.
+However, we could only say anything meaningful about each scenario, if we had several replications.
+Therefore, we should run the previous steps several times, and record the results.
+Sounds a tedious job!
+Fortunately, we can automate it!
+
+# 2. Creating a generalized dataset creating function
+
+In order to try out several different sample sizes, we need to create a function that generates the data with different parameters (such as the sample size), and evaluates if the result is significant or not.
+
+Let's make a function that generates a whole data frame!
+This way, we can generate as many replications as we want.
+To do this, we use the powerful feature of nested datasets.
+This means that each cell can hold a list element.
+For e.g. this way we can keep dataframes inside the cells of dataframes!
+
+```{r simulate df}
+# A function that generates a dataset based on theoretical parameters
+# n: number of observations in a cell
+# means: a vector of theoretical means for the groups
+# sds: a vector of theoretical sds for the groups
+# groups: a vector of group names
+
+# These parameters are set here for testing purposes
+n = 500 
+means = c(400, 425)
+sds = 100
+groups = c("Placebo", "Alcohol")
+
+generate_dataset <- function(n, means, sds, groups){
+  
+# First we just define the groups
+# Then we add the sample size and the theoretical parameters
+tibble(group = groups,
+       n = n, 
+       t_mean = means, 
+       t_sd = sds) %>% 
+  # Then we generate data into the cells as nested list values
+  mutate(value = pmap(list(n, t_mean, t_sd),
+                     ~rnorm(..1, ..2, ..3)),
+         # Generate ids for each data point. This will make it possible to connect data
+         # ponits like they were coming from the same person
+         id = map2(group, n, 
+                   ~paste(.x, 1:.y, sep = "_"))) %>% 
+  # Remove the theoretical parameters, but keep the sample size
+  select(-t_mean, -t_sd) %>% 
+  # Then unpack the data, that will be in long format
+  unnest(c(value, id)) %>% 
+  # Make the first level of the groups the reference level
+  mutate(group =  fct_relevel(group, groups[1]))
+  
+}
+
+```
+
+## Let's verify that the function works as intended
+
+-   First we check if it can create a similar dataset than before
+-   Then we also check if it works with more than two groups
+
+```{r}
+
+rt_df <-
+  generate_dataset(n = 500, 
+                   means = c(400, 425), 
+                   sds = 100,
+                   groups = c("Placebo", "Alcohol"))
+
+# Verify mean and sd
+rt_df %>% 
+  group_by(group) %>% 
+  summarise(avg_rt = mean(value),
+            sd_rt = sd(value),
+            n = n())
+
+# More groups
+generate_dataset(n = 500, 
+                 means = c(400, 425, 450), 
+                 sds = 100,
+                 groups = c("Placebo", "Alcohol", "More alcohol")) %>% 
+  group_by(group) %>% 
+  summarise(avg_rt = mean(value),
+            sd_rt = sd(value),
+            n = n())
+
+```
+
+# 3.Calculating statistical power
+
+## Generating replications
+
+First, we generate multiple replications for each dataset, so we can simulate the randomness of the statistical processes.
+
+```{r}
+sim_data <- 
+  tibble(dataset = 1:50) %>% 
+# Now, we simply iterate through each line, and create several datasets
+  mutate(data = map(dataset, 
+                    ~generate_dataset(n = 100,
+                                      means = c(400, 425), 
+                                      sds = 100,
+                                      groups = c("Placebo",
+                                                 "Alcohol"))
+                    )
+         )
+
+sim_data
+# Let's check what's in each individual dataset
+unnest(sim_data, data)
+
+```
+
+Now, we need to test our hypothesis on each generated dataset.
+Again, we can use the nested structure, so we will store the model for each dataset in a variable of the dataframe.
+
+```{r, warning=FALSE, message=FALSE}
+sim_result <-
+  sim_data %>% 
+  mutate(model = map(data, 
+                     # Run the formula to test the hypothesis
+                     ~lm(value ~ group, data = .x) %>% 
+                     # Put the results into a tidy dataframe
+                      tidy()
+                     ))
+
+# What's in the model variable? A tibble of statistical output
+sim_result %>% 
+  unnest(model)
+
+# We can select the relevant row and check if the p value is below the significance level.
+sim_result %>% 
+# Get the relevant p values out 
+      mutate(p = map_dbl(model,
+                         ~filter(.x, str_detect(term, "^group")) %>% 
+                          pull(p.value)),
+# Generate a variable that evaluates if the significance is under the treshold
+             sig = p <= .05) %>% 
+# We can now calculate the proportion when the H0 was rejected
+      summarise(power = mean(sig))
+
+```
+
+As we can see, the statistical power is pretty low if we have a cell size of 100.
+If we increase it over 200, then we hit 80% power.
+But how much participants we need exactly?
+Let's run the simulation for multiple sample sizes.
+
+# 4. Calculate power for different sample sizes
+
+To be able to create replications for each scenario that we test, we need to define the sample sizes, and also the number of repliactions for each sample size.
+The more datasets we have for each sample size, the more reliable our estimation gets.
+Each dataset should be numbered, just as each participant in the datasets.
+We can use `crossing()` function to do this.
+Crossing creates rows for every combinations of the specified variables in a dataset.
+
+Let's define the minimum sample size as 30, and increase it until 300 with increments of 30.
+We can do this using the `seq()` function.
+
+```{r}
+multiple_n <-
+  crossing(group_size = seq(from = 30, to = 300, by = 30),
+           replication = 1:50) %>% 
+  mutate(dataset = map(group_size, 
+                       ~generate_dataset(n = .x,
+                                         means = c(400, 425), 
+                                         sds = 100,
+                                         groups = c("Placebo",
+                                                    "Alcohol"))
+                       )
+         )
+
+multiple_n
+
+```
+
+## Sidenote: Avoiding the hardcoding of values into function calls
+
+It is not a good practice to hardcode the parameters into functions.
+The good practice is to define the parameters in the beginning of the script, than we can feed the variables to the function.
+This way you only need to change your script at one place.
+Let's do that.
+Also, please notice that the simulation now is starting to require more computational power.
+If you set a high number of replications, and wide range of sample sizes, it may get quite slow.
+For now, let's keep the number of replications low, so we don't need to wait for too long to run our code.
+We will have some tricks to speed up the code later!
+
+```{r}
+# Let's keep the parameters separate from the functions!
+
+# These parameters define the parameter matrix
+
+replications = 50 # The number of replications for each scenario
+min_sample = 30
+max_sample = 300
+sample_increment = 30
+
+# These parameters define the datasets
+means = c(400, 425) # The mean for the groups
+sds = 100
+groups = c("Placebo", "Alcohol")
+
+# These parameters define the evaluation of the results
+significance_level = .05 # The treshold for false positives (we will need this later)
+
+# This is how the function call should look like:
+multiple_n <-
+  crossing(group_size = seq(from = min_sample, 
+                            to = max_sample, 
+                            by = sample_increment),
+           replication = 1:replications) %>% 
+  # Now, we simply iterate through each line, and create a dataset
+  mutate(data = map(group_size, 
+                    ~generate_dataset(n = .x,
+                                      means = means, 
+                                      sds = sds,
+                                      groups = groups)))
+
+multiple_n
+
+```
+
+## Calculate the required sample size
+
+Now, we can calculate the statistical power for each sample size.
+Thus, we can learn how many participants are needed to achieve a certain statistical power.
+
+```{r, warning=FALSE, message=FALSE}
+multiple_result <-
+  multiple_n %>% 
+  mutate(model = map(data, 
+                     # Run the formula to test the hypothesis
+                     ~lm(value ~ group, data = .x) %>% 
+                     # Put the results into a tidy dataframe
+                      tidy()
+                     ))
+
+multiple_result
+
+# We can  select the term of interest that evaluates the hypothesis, and see if it is significant or not
+
+multiple_power <-
+  multiple_result %>% 
+    # Extract the p value of the interaction from the model
+    mutate(p = map_dbl(model,
+                       ~filter(.x, str_detect(term, "^group")) %>% 
+                        pull(p.value)),
+# Generate a variable that evaluates if the significance is under the treshold
+           sig = p <= significance_level) %>% 
+# See the proportion when we rejected the null hypothesis for each sample size. This is actually the statistical power!!
+  group_by(group_size) %>% 
+  summarise(power = mean(sig))
+
+multiple_power
+
+# Visualize results
+multiple_power %>% 
+  ggplot() +
+  aes(x = group_size, y = power) +
+  geom_point() +
+  geom_line(alpha = .7, size = 1.2) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent_format()) +
+  geom_hline(yintercept = .8, lty = "dashed", color = "red") +
+  labs(x = "Cell size",
+       title = "Statistical power as a function of sample size")
+
+```
+
+# 5. Improving performance
+
+You may see that every time we regenerate the data, the line looks a bit differently.
+This is because of the randomness.
+We can reduce this randomness by increasing the number of replications.
+10,000 replication for each sample size will make the line fairly robust.
+However, it can also make our simulation become super slow!
+There are a few ways to overcome this problem.
+
+## Interpolate between sample sizes
+
+When we created our parameter matrix, we could have chosen to increase the sample size one-by-one, instead of using increments of 30.
+This would be very slow.
+But if we want to calculate the *exact* sample size to achieve 80% power, we can intrapolate between the values (just as the line interpolated on the figure).
+
+```{r}
+interpolated_power <-
+  # Create all posible sample sizes between the two extremes
+  tibble(group_size = min_sample:max_sample) %>% 
+  # Add existing data
+  left_join(multiple_power, by = "group_size") %>% 
+  # Use linear interpolation
+  mutate(power = approx(x = group_size,
+                        y = power,
+                        xout = group_size)$y)
+
+
+head(interpolated_power, 20)
+
+# Calculate the exact number of participants needed in each cell for specific power
+interpolated_power %>% 
+  transmute(group_size,
+            `>= .80` = power >= .80) %>% 
+  pivot_longer(-group_size,
+               names_to = "power") %>% 
+  # Keep only the value where the power first surpasses the threshold
+  filter(value) %>% 
+  group_by(power) %>% 
+  summarise(required_cell_size = first(group_size))
+
+```
+
+## Using extra computational power to increase speed
+
+For larger and more complex datasets, more replications, and calculations that require a lot of processing power, the power analysis can become slow. To increase speed, you can:
+- Use multiple processors (parallel processing)
+- Use the GPU
+- Use remote servers (e.g. google cloud, university cluster, etc.)
+
+Here, I only add the multiple processing, using the `{furrr}` package. This packages can parallelize all `map()` operations seamlessly. For that, you have to load the package, set up the parallel processing, and use the furrr variant of the function (e.g. `future_map()`).
+
+To set up parallel processing, just put this in the beginning of your script. Note that this may not work in non-Windows operating systems.
+
+```{r eval=FALSE}
+# This chunk is not evaluated, only code is shown
+library(furrr)
+plan(multisession(workers = availableCores())) 
+
+# Let's increase the number of replications
+replications = 5000
+
+multiple_n <-
+  crossing(group_size = seq(from = min_sample, 
+                            to = max_sample, 
+                            by = sample_increment),
+           replication = 1:replications) %>% 
+  # Mind that now I use future_map() in the next line
+  mutate(data = future_map(group_size, 
+                          ~generate_dataset(n = .x,
+                                            means = means, 
+                                            sds = sds,
+                                            groups = groups),
+                          .progress = TRUE
+                          )
+         )
+
+multiple_power <-
+  multiple_n %>% 
+  # future_map() in next line, you can use a progress bar
+  mutate(model = future_map(data, 
+                           ~lm(value ~ group, data = .x) %>% 
+                            tidy(),
+                            .progress = TRUE)) %>% 
+  # It is not worth using future_map for fast tasks
+  mutate(p = map_dbl(model,
+                     ~filter(.x, str_detect(term, "^group")) %>% 
+                     pull(p.value)),
+         sig = p <= significance_level) %>% 
+  group_by(group_size) %>% 
+  summarise(power = mean(sig))
+
+multiple_power
+
+# Visualize results
+multiple_power %>% 
+  ggplot() +
+  aes(x = group_size, y = power) +
+  geom_point() +
+  geom_line(alpha = .7, size = 1.2) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent_format()) +
+  geom_hline(yintercept = .8, lty = "dashed", color = "red") +
+  labs(x = "Cell size",
+       title = "Statistical power as a function of sample size")
+
+```
+
+#6. Complex designs
+
+At this point, we may want to abandon our own dataset generating function, because we learned how it works, and how to write one.
+Instead, I recommend using the `sim_design()` function from the `{faux}` package, that can generate datasets for complex designs.
+See vignette here: <https://debruine.github.io/faux/articles/sim_design.html>.
+See exercises.
+
+The only problem with `sim_design()` is that it can only simulate normally distributed variables.
+However, it has functions to convert between normal and other distributions (e.g. binomial, Likert).
+See: <https://debruine.github.io/faux/articles/distributions.html> so generally we can first generate the datasets with normal variables, and transform the variables into differently distributed variables.
+
+Let's try a more complex study design!
+
+Study 2: We investigate the same problem, but this time, we employ a pre-post design, while still having the groups. We will use `sim_design()`
+
+```{r}
+study2 <- 
+  sim_design(n = 100,
+             between = list(group = c("Placebo", "Alcohol")),
+             within = list(measurement = c("Pre", "Post")),
+             mu = list(Placebo = c(400, 395),
+                       Alcohol = c(400, 420)), 
+             sd = 10,
+             dv = "rt",
+             # We should specify the correlation between the measurements
+             r = .5, 
+             plot = FALSE)
+
+head(study2, 10)
+
+plot_design(study2)
+
+# Put to long format
+study_long <- 
+  wide2long(study2) %>% 
+  mutate(measurement = fct_relevel(measurement, "Pre"))
+
+# Check the hypothesis
+
+lmer(rt ~ group * measurement + (1|id), data = study_long) %>% 
+  summary()
+
+```
+
+## Adding confounders
+
+What if we want to add age? We can add variables that are correlated with other pre-existing variables. Age is a bit tricky, because it must be an integer, and it should be within reasonable boundaries. So after creating it, it must be adjusted.
+
+```{r}
+
+study2 <-
+  study2 %>% 
+  mutate(age = rnorm_pre(x = Pre, mu = 50, sd = 20, r = .2) %>% 
+               norm2trunc(min = 18, max = 90) %>% 
+               round(0))
+
+# Visualize age
+ggplot(study2) +
+  aes(x = age) +
+  geom_histogram()
+
+# Check the hypothesis
+
+lmer(rt ~ group * measurement + age + (1|id), data = wide2long(study2)) %>% 
+  summary()
+
+```
+
+# FINAL EXERCISE
+
+Let's make a power analysis for this design! 
+Our hypothesis: Alcohol will increase the reaction time after drinking it, vs. drinking placebo, even after controlling for the confounding effect of age. You can use the parameters that we used in the chunk above. What is the exact required sample size?
+
+
+```{r}
+# Create dataset creating function
+set.seed(2021)
+
+n = 100
+between = list(group = c("Placebo", "Alcohol"))
+within = list(measurement = c("Pre", "Post"))
+mus = list(Placebo = c(400, 405),
+           Alcohol = c(400, 410)) 
+sds = 10
+r = .5
+replications = 100
+
+generate_complex <- function(n, between, within, mu, sd, r){
+  sim_design(n = n,
+             between = between,
+             within = within,
+             mu = mus, 
+             sd = sds,
+             dv = "rt",
+             r = r, 
+             plot = FALSE) %>% 
+  mutate(age = rnorm_pre(x = Pre, mu = 50, sd = 20, r = .2) %>% 
+               norm2trunc(min = 18, max = 90) %>% 
+               round(0)) %>% 
+  wide2long() %>% 
+  mutate(measurement = fct_relevel(measurement, "Pre"),
+         group = fct_relevel(group, "Placebo"))
+}
+
+# Create parameter matrix 
+# Generate multiple datasets for each sample size
+
+study2_data <-
+  crossing(cell_size = seq(10, 100, 10),
+           sample = 1:replications) %>% 
+  mutate(data = map(cell_size, 
+                    ~generate_complex(.x, between, within, mus, sds, r)))
+
+# Evaluate the models
+study2_result <-
+  study2_data %>% 
+  mutate(
+         model = map(data, 
+                     ~lmer(rt ~ group * measurement + age + (1|id), data = .x) %>% 
+                       tidy()),
+         p = map_dbl(model, 
+                     ~filter(.x, term == "groupAlcohol:measurementPost") %>% 
+                      pull(p.value)),
+         sig = p <.05) %>% 
+  group_by(cell_size) %>% 
+  summarise(power = mean(sig))
+
+# Interpolate between values to find exact required sample size
+study2_power <-
+  tibble(cell_size = 10:100) %>% 
+  left_join(study2_result, by = "cell_size") %>% 
+  mutate(power = approx(x = cell_size,
+                        y = power,
+                        xout = cell_size)$y)
+
+
+study2_power %>% 
+  filter(power >= .8)
+
+required_n <-
+  study2_power %>% 
+  filter(power >= .8) %>% 
+  summarise(first(cell_size)) %>% 
+  pull()
+
+
+# Visualize results
+study2_power %>% 
+  ggplot() +
+  aes(x = cell_size, y = power) +
+  geom_line(alpha = .7, size = 1.2) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent_format()) +
+  geom_hline(yintercept = .8, lty = "dashed", color = "red") +
+  geom_vline(xintercept = required_n, lty = "dashed", color = "red") +
+  geom_text(aes(label = required_n), x = required_n, y = .78, hjust = 0) +
+  labs(x = "Cell size",
+       title = "Statistical power as a function of sample size")
+
+
+```
+
+**Answer**: Statistical power is reached when we have `r required_n` participants / cell (condition)
+which is `r required_n*2` participants altogether.
+Please mind that this estimation can be made more accurate with increasing the
+number of replications (e.g. to 10,000).
