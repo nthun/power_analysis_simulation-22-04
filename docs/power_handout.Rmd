@@ -38,7 +38,7 @@ theme_set(theme_light()) # Set plot theme
 
 # What is this?
 
-This is a step-by-step tutorial to use Monte Carlo simulation for estimating the required sample size for a hypothesis test. Accompanying slides: https://docs.google.com/presentation/d/1wQGDNUw7c2zxIZOnrCpifQcsjeKOdqnVQkeankOBbhA
+This is a step-by-step tutorial to use Monte Carlo simulation for estimating the required sample size for a hypothesis test. Accompanying slides: https://docs.google.com/presentation/d/1O95k2feFerE8xSubHNipbsV-Xr0LXQ6mKAjlpxH5KFA
 
 # 1. Create a prototype
 
@@ -584,7 +584,11 @@ ggplot(study2) +
 
 # Check the hypothesis
 
-lmer(rt ~ group * measurement + age + (1|id), data = wide2long(study2)) %>% 
+lmer(rt ~ group * measurement + age + (1|id), 
+     data = wide2long(study2, 
+                      dv = "rt",
+                      within_factors = c("Placebo", "Alcohol"),
+                      within_cols = 3:4)) %>% 
   summary()
 
 ```
