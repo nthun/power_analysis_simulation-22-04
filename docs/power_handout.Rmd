@@ -586,25 +586,25 @@ What if we want to add age into our model as a predictor? We can add variables t
 
 # rnorm_pre generates a randomly distributed variable that is correlated with a pre-existing variable
 
-study2 <-
+study2_long <-
   study2 %>% 
   mutate(age = rnorm_pre(x = Pre, mu = 50, sd = 20, r = .2) %>% 
                # This function truncates the variable values
                norm2trunc(min = 18, max = 90) %>% 
-               round(0))
+               round(0)) %>% 
+  pivot_longer(Pre:Post,
+               values_to = "rt",
+               names_to = "measurement")
 
 # Visualize age
-ggplot(study2) +
+ggplot(study2_long) +
   aes(x = age) +
   geom_histogram()
 
 # Test the hypothesis
 
 lmer(rt ~ group * measurement + age + (1|id), 
-     data = wide2long(study2, 
-                      dv = "rt",
-                      within_factors = c("Placebo", "Alcohol"),
-                      within_cols = 3:4)) %>% 
+     data = study2_long) %>% 
   summary()
 
 ```
@@ -624,7 +624,7 @@ between = list(group = c("Placebo", "Alcohol"))
 within = list(measurement = c("Pre", "Post"))
 mus = list(Placebo = c(400, 405),
            Alcohol = c(400, 410)) 
-sds = 10
+sds = 100
 r = .5
 replications = 100
 
@@ -642,7 +642,9 @@ generate_complex <- function(n, between, within, mu, sd, r){
   mutate(age = rnorm_pre(x = Pre, mu = 50, sd = 20, r = .2) %>% 
                norm2trunc(min = 18, max = 90) %>% 
                round(0)) %>% 
-  wide2long() %>% 
+  pivot_longer(Pre:Post,
+               values_to = "rt",
+               names_to = "measurement") %>% 
   # Set baselines
   mutate(measurement = fct_relevel(measurement, "Pre"),
          group = fct_relevel(group, "Placebo"))
